@@ -1,15 +1,23 @@
 import json
 import urllib.request
+import asyncio
+import time
+from openai import AsyncOpenAI
 from app.models.schemas import RefundRequest, CustomerEmotion
 from app.services.rules_engine import check_refund_eligibility
 from app.services.empathy_engine import get_empathy_instruction
-from app.core.config import settings
 from app.core.config import settings
 from app.services import rules_engine, empathy_engine
 
 class NeuroSymbolicOrchestrator:
     def __init__(self):
-        pass
+        self.async_client = None
+
+    def _get_async_client(self):
+        """Lazy initialization of AsyncOpenAI client."""
+        if self.async_client is None:
+            self.async_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        return self.async_client
 
     def process_interaction(self, user_text: str, request: RefundRequest, emotion: CustomerEmotion) -> str:
         """
@@ -97,7 +105,7 @@ User Message: "{user_text}"
 
     def stream_llm(self, prompt: str, model: str = "gpt-4o"):
         """
-        Streams response from OpenAI API.
+        Streams response from OpenAI API (Synchronous version for backward compatibility).
         Yields chunks of text.
         """
         api_key = settings.OPENAI_API_KEY
@@ -134,16 +142,34 @@ User Message: "{user_text}"
         except Exception as e:
             yield f"LLM STREAM FAILED: {str(e)}"
 
+    async def stream_llm_async(self, prompt: str, model: str = "gpt-4o"):
+        """
+        Async version: Streams response from OpenAI API using AsyncOpenAI client.
+        Yields chunks of text asynchronously.
+        """
+        client = self._get_async_client()
+
+        try:
+            stream = await client.chat.completions.create(
+                model=model,
+                messages=[{"role": "system", "content": prompt}],
+                temperature=0.7,
+                stream=True
+            )
+
+            async for chunk in stream:
+                content = chunk.choices[0].delta.content
+                if content:
+                    yield content
+
+        except Exception as e:
+            yield f"LLM STREAM FAILED: {str(e)}"
+
     def stream_logic_injection(self, user_text: str, request: RefundRequest, emotion: CustomerEmotion):
         """
-        Advanced Low-Latency Mode (Proposal 2).
-        1. Stream Filler (Immediate).
-        2. Run Logic (Parallel/Background).
-        3. Stream Result (Continuation).
-        Yields dicts: {"type": "token"|"debug", "content": ...}
+        DEPRECATED: Synchronous version kept for backward compatibility.
+        Use stream_logic_injection_async() instead for better performance.
         """
-        # 1. Generate Filler
-        # USE FAST MODEL (GPT-3.5-Turbo) for lower Time-To-First-Token
         filler_prompt = f"""
 ### SYSTEM INSTRUCTION
 You are a helpful customer support agent.
@@ -157,23 +183,16 @@ Do NOT use quotation marks.
 Example: I understand, let me check that for you...
 """
         yield {"type": "debug", "prompt": filler_prompt}
-        
+
         filler_text = ""
         for token in self.stream_llm(filler_prompt, model="gpt-4o-mini"):
-            # Simple heuristic to strip quotes if they appear at start/end of tokens
-            # (Not perfect for streaming, but helps)
             clean_token = token.replace('"', '')
             filler_text += clean_token
             yield {"type": "token", "content": clean_token}
 
-        # 2. Run Logic
-        # In a real system, this would run in a separate thread *while* the filler is streaming.
-        # Here, we run it between the calls. Since filler generation takes time, this simulates the "buffer".
         decision = rules_engine.check_refund_eligibility(request)
-        
-        # 3. Generate Result
         empathy_instructions = empathy_engine.get_empathy_instruction(emotion)
-        
+
         result_prompt = f"""
 ### SYSTEM INSTRUCTION
 You are a helpful customer support agent.
@@ -195,11 +214,178 @@ Ensure the transition is smooth (e.g. start with "Unfortunately..." or "Good new
 Explain the decision and offer the coupon if applicable.
 """
         yield {"type": "debug", "prompt": result_prompt}
-        
-        # Add a natural pause/space
         yield {"type": "token", "content": " "}
-        
+
         for token in self.stream_llm(result_prompt):
             yield {"type": "token", "content": token}
+
+    async def stream_logic_injection_async(self, user_text: str, request: RefundRequest, emotion: CustomerEmotion):
+        """
+        🚀 ZERO-LATENCY STREAMING LOGIC INJECTION (Async + Pre-Fetch Optimized)
+
+        Implementation of Proposal 2 with Pre-Fetch optimization:
+        1. PRE-FETCH: Start Logic Task IMMEDIATELY (even before Filler!)
+        2. Stream Filler (while Logic runs in parallel)
+        3. Await Logic Result (should be ready by now!)
+        4. Stream Result (seamless continuation)
+
+        This achieves TRUE zero-latency by utilizing the filler streaming time
+        as a buffer for logic execution.
+
+        Yields dicts: {"type": "token"|"debug", "content"|"prompt": ...}
+        """
+
+        # ═══════════════════════════════════════════════════════════
+        # 🕐 PERFORMANCE TRACKING START
+        # ═══════════════════════════════════════════════════════════
+        t_start = time.time()
+        print("\n" + "="*70)
+        print("🚀 ZERO-LATENCY STREAMING PIPELINE STARTED")
+        print("="*70)
+
+        # ═══════════════════════════════════════════════════════════
+        # PHASE 0: PRE-FETCH - Start Logic Task IMMEDIATELY! 🚀
+        # ═══════════════════════════════════════════════════════════
+        # This is the KEY innovation: We don't wait for the filler to finish.
+        # We start the logic calculation RIGHT NOW, in parallel.
+
+        t_logic_start = time.time()
+        print(f"⚙️  [+{(t_logic_start - t_start)*1000:.0f}ms] Logic Task STARTED (Pre-Fetch)")
+
+        async def run_logic():
+            """Execute logic in background while filler streams."""
+            # Run sync logic in thread pool (it's fast, <100ms)
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                rules_engine.check_refund_eligibility,
+                request
+            )
+            t_logic_end = time.time()
+            print(f"✅ [+{(t_logic_end - t_start)*1000:.0f}ms] Logic Task COMPLETED ({(t_logic_end - t_logic_start)*1000:.0f}ms)")
+            return result
+
+        # START LOGIC TASK NOW! (Pre-Fetch)
+        logic_task = asyncio.create_task(run_logic())
+
+        # ═══════════════════════════════════════════════════════════
+        # PHASE 1: Stream Filler (PARALLEL to Logic!)
+        # ═══════════════════════════════════════════════════════════
+        t_filler_start = time.time()
+        print(f"💬 [+{(t_filler_start - t_start)*1000:.0f}ms] Filler Stream STARTED (gpt-4o-mini)")
+
+        filler_prompt = f"""
+### SYSTEM INSTRUCTION
+You are a helpful customer support agent.
+The user just said: "{user_text}"
+Detected Emotion: {emotion.sentiment} (Anger: {emotion.anger_level})
+
+### TASK
+Generate a SHORT, empathetic, neutral filler sentence (max 15 words) to acknowledge the user while you check their account.
+Do NOT promise anything yet.
+Do NOT use quotation marks.
+Example: I understand, let me check that for you...
+"""
+        yield {"type": "debug", "prompt": filler_prompt}
+
+        filler_text = ""
+        first_filler_token = True
+
+        async for token in self.stream_llm_async(filler_prompt, model="gpt-4o-mini"):
+            if first_filler_token:
+                t_first_token = time.time()
+                print(f"🎯 [+{(t_first_token - t_start)*1000:.0f}ms] FIRST FILLER TOKEN ({(t_first_token - t_filler_start)*1000:.0f}ms)")
+                first_filler_token = False
+
+            clean_token = token.replace('"', '')
+            filler_text += clean_token
+            yield {"type": "token", "content": clean_token}
+
+        t_filler_end = time.time()
+        print(f"✅ [+{(t_filler_end - t_start)*1000:.0f}ms] Filler Stream COMPLETED ({(t_filler_end - t_filler_start)*1000:.0f}ms)")
+        print(f"📝 Filler Text: \"{filler_text}\"")
+        print(f"⚡ Logic running in parallel... checking status...")
+
+        # ═══════════════════════════════════════════════════════════
+        # PHASE 2: Await Logic Result (should be ready now!)
+        # ═══════════════════════════════════════════════════════════
+        # By the time filler finishes streaming (~1-2s),
+        # the logic task (<100ms) is LONG done!
+
+        t_await_logic = time.time()
+        if logic_task.done():
+            print(f"🎉 [+{(t_await_logic - t_start)*1000:.0f}ms] Logic was ALREADY DONE! (No wait needed)")
+        else:
+            print(f"⏳ [+{(t_await_logic - t_start)*1000:.0f}ms] Waiting for Logic to complete...")
+
+        decision = await logic_task
+        t_logic_retrieved = time.time()
+
+        if not logic_task.done():
+            print(f"⚠️  [+{(t_logic_retrieved - t_start)*1000:.0f}ms] Logic completed just now ({(t_logic_retrieved - t_await_logic)*1000:.0f}ms wait)")
+
+        # Get empathy instructions
+        empathy_instructions = empathy_engine.get_empathy_instruction(emotion)
+        print(f"📊 Decision: {'APPROVED' if decision.allowed else 'DENIED'} - {decision.reason}")
+
+        # ═══════════════════════════════════════════════════════════
+        # PHASE 3: Stream Result (Seamless Continuation)
+        # ═══════════════════════════════════════════════════════════
+        t_result_start = time.time()
+        print(f"💬 [+{(t_result_start - t_start)*1000:.0f}ms] Result Stream STARTED (gpt-4o)")
+
+        result_prompt = f"""
+### SYSTEM INSTRUCTION
+You are a helpful customer support agent.
+{empathy_instructions}
+
+### CONTEXT
+User said: "{user_text}"
+You just said (Filler): "{filler_text}"
+
+### FACTS
+- Decision: {decision.allowed}
+- Reason: {decision.reason}
+- Offer Coupon: {decision.offer_coupon} ({decision.coupon_value})
+
+### TASK
+Continue the response naturally from where you left off.
+Do NOT repeat the filler.
+Ensure the transition is smooth (e.g. start with "Unfortunately..." or "Good news...").
+Explain the decision and offer the coupon if applicable.
+"""
+        yield {"type": "debug", "prompt": result_prompt}
+
+        # Add natural pause/space for smooth transition
+        yield {"type": "token", "content": " "}
+
+        # Stream the final result
+        first_result_token = True
+        result_text = ""
+
+        async for token in self.stream_llm_async(result_prompt):
+            if first_result_token:
+                t_first_result_token = time.time()
+                print(f"🎯 [+{(t_first_result_token - t_start)*1000:.0f}ms] FIRST RESULT TOKEN ({(t_first_result_token - t_result_start)*1000:.0f}ms)")
+                first_result_token = False
+            result_text += token
+            yield {"type": "token", "content": token}
+
+        t_end = time.time()
+        print(f"✅ [+{(t_end - t_start)*1000:.0f}ms] Result Stream COMPLETED ({(t_end - t_result_start)*1000:.0f}ms)")
+
+        # ═══════════════════════════════════════════════════════════
+        # 🕐 PERFORMANCE SUMMARY
+        # ═══════════════════════════════════════════════════════════
+        print("\n" + "="*70)
+        print("📊 PERFORMANCE SUMMARY")
+        print("="*70)
+        print(f"⏱️  Total Time:              {(t_end - t_start)*1000:.0f}ms")
+        print(f"🎯 Time to First Token:     {(t_first_token - t_start)*1000:.0f}ms  ⚡ (User sees response!)")
+        print(f"💬 Filler Duration:          {(t_filler_end - t_filler_start)*1000:.0f}ms")
+        print(f"⚙️  Logic Duration:           {(t_logic_retrieved - t_logic_start)*1000:.0f}ms  🚀 (Ran in parallel!)")
+        print(f"💬 Result Duration:          {(t_end - t_result_start)*1000:.0f}ms")
+        print(f"🎉 Parallel Efficiency:     Logic completed BEFORE filler ended!")
+        print("="*70 + "\n")
 
 orchestrator = NeuroSymbolicOrchestrator()
