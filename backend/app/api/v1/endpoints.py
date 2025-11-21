@@ -103,27 +103,21 @@ async def websocket_endpoint(websocket: WebSocket):
             user_data = RefundRequest(**user_data_dict)
             emotion_data = CustomerEmotion(**emotion_data_dict)
 
-            # 2. Process Logic (Neuro-symbolic)
-            engine_prompt = orchestrator.process_interaction(
-                user_text=user_text,
-                request=user_data,
-                emotion=emotion_data
-            )
-
-            # 3. Send Debug Event
-            await websocket.send_json({
-                "type": "debug",
-                "prompt": engine_prompt
-            })
-
-            # 4. Stream LLM Tokens
-            full_response = ""
-            for token in orchestrator.stream_llm(engine_prompt):
-                full_response += token
-                await websocket.send_json({
-                    "type": "token",
-                    "content": token
-                })
+            # 2. Process Logic (Neuro-symbolic) & Stream (Injection Mode)
+            # We use the new "Zero Latency" pipeline
+            for event in orchestrator.stream_logic_injection(user_text, user_data, emotion_data):
+                if event["type"] == "debug":
+                    await websocket.send_json({
+                        "type": "debug",
+                        "prompt": event["prompt"]
+                    })
+                elif event["type"] == "token":
+                    await websocket.send_json({
+                        "type": "token",
+                        "content": event["content"]
+                    })
+            
+            # Optional: Send "Done" event or just let the client infer
             
             # Optional: Send "Done" event or just let the client infer
             
