@@ -501,6 +501,9 @@ async def synthesize_speech_streaming(text: str, websocket: WebSocket, emotion_c
             "total_latency": total_latency,
         })
 
+        # Return latency metrics for pipeline metrics tracking
+        return total_latency
+
     except Exception as e:
         print(f"  ❌ Error in TTS streaming: {e}", flush=True)
         import traceback
@@ -509,6 +512,7 @@ async def synthesize_speech_streaming(text: str, websocket: WebSocket, emotion_c
             "type": "tts_error",
             "error": str(e)
         })
+        return 0  # Return 0 on error
 
 
 @router.websocket("/ws/test-voice")
@@ -724,8 +728,8 @@ async def test_voice_websocket(websocket: WebSocket):
             # ================================================================
             print("  Phase 6: Text-to-Speech (Cartesia WebSocket Streaming)...", flush=True)
 
-            # Stream TTS audio in real-time
-            await synthesize_speech_streaming(
+            # Stream TTS audio in real-time and capture latency
+            tts_latency = await synthesize_speech_streaming(
                 response["text"],
                 websocket,
                 emotion_for_response["category"]
