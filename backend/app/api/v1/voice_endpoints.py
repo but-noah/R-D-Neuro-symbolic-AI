@@ -27,11 +27,7 @@ import json
 from typing import Dict, Any, Optional
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from openai import AsyncOpenAI
-from deepgram import (
-    DeepgramClient,
-    LiveTranscriptionEvents,
-    LiveOptions,
-)
+from deepgram import DeepgramClient
 from cartesia import AsyncCartesia
 
 # Import our services
@@ -46,7 +42,7 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY")
 
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-deepgram_client = DeepgramClient(api_key=DEEPGRAM_API_KEY) if DEEPGRAM_API_KEY else None
+deepgram_client = DeepgramClient(api_key=DEEPGRAM_API_KEY) if DEEPGRAM_API_KEY else None  # Keyword arg!
 cartesia_client = AsyncCartesia(api_key=CARTESIA_API_KEY) if CARTESIA_API_KEY else None
 
 # Cartesia voice configuration

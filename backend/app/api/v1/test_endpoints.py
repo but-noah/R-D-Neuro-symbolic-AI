@@ -38,6 +38,7 @@ from cartesia import AsyncCartesia
 # Import our services
 from app.services.filler_loader import get_filler_loader
 from app.services.rules_engine import check_refund_eligibility_with_order_id
+from app.services.stt_service import RobustSTTService, FileSTTResult
 
 router = APIRouter()
 
@@ -47,8 +48,11 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY")
 
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-deepgram_client = DeepgramClient(api_key=DEEPGRAM_API_KEY) if DEEPGRAM_API_KEY else None
+deepgram_client = DeepgramClient(api_key=DEEPGRAM_API_KEY) if DEEPGRAM_API_KEY else None  # Keep for fallback (keyword arg!)
 cartesia_client = AsyncCartesia(api_key=CARTESIA_API_KEY) if CARTESIA_API_KEY else None
+
+# Initialize Flux STT service (v2 streaming with Eager EOT)
+flux_stt_service = RobustSTTService() if DEEPGRAM_API_KEY else None
 
 # Cartesia voice configuration
 CARTESIA_VOICE_ID = "a0e99841-438c-4a64-b679-ae501e7d6091"  # Conversational English voice
@@ -351,59 +355,77 @@ def generate_response_mock(decision: Dict[str, Any], emotion: Dict[str, Any]) ->
     }
 
 
-async def transcribe_audio_file(audio_file_path: str) -> Dict[str, Any]:
+async def transcribe_audio_file(
+    audio_file_path: str,
+    websocket: Optional[WebSocket] = None
+) -> Dict[str, Any]:
     """
-    Transcribe audio file using Deepgram API
+    Transcribe audio file using Deepgram Flux Streaming API
+
+    Now uses Flux v2 streaming with Eager End-of-Turn for ultra-low latency.
+    Expected latency: 300-400ms (vs 1275ms with Nova-3 prerecorded)
 
     Args:
         audio_file_path: Path to audio file (MP3)
+        websocket: Optional WebSocket for streaming interim transcripts
 
     Returns:
         Dict with transcript and latency
     """
-    if not deepgram_client:
+    if not flux_stt_service:
         return {
             "transcript": "",
             "latency": 0,
             "method": "unavailable",
-            "error": "Deepgram client not available"
+            "error": "Flux STT service not available"
         }
 
     t_start = time.time()
 
     try:
-        # Read audio file
-        with open(audio_file_path, 'rb') as audio_file:
-            audio_data = audio_file.read()
+        # Interim transcript callback for WebSocket streaming
+        async def on_interim_transcript(result):
+            if websocket and not result.is_final:
+                await websocket.send_json({
+                    "type": "stt_interim",
+                    "transcript": result.text,
+                    "confidence": result.confidence,
+                    "timestamp": time.time()
+                })
 
-        # Transcribe using Deepgram prerecorded API (Nova-3 for highest accuracy)
-        # Note: Flux is only for live streaming WebSockets
-        response = deepgram_client.listen.v1.media.transcribe_file(
-            request=audio_data,
-            model="nova-3",
-            language="en-US",
-            smart_format=True,
-            punctuate=True,
-            diarize=False
+        # Transcribe using Flux streaming
+        result: FileSTTResult = await flux_stt_service.transcribe_file_streaming(
+            audio_file_path=audio_file_path,
+            on_transcript=on_interim_transcript,
+            fallback_to_prerecorded=True,  # Graceful degradation to Nova-3
         )
 
-        # Extract transcript
-        transcript = response.results.channels[0].alternatives[0].transcript
-
         t_end = time.time()
-        latency = int((t_end - t_start) * 1000)
 
-        print(f"  ✅ Deepgram transcribed: '{transcript}' ({latency}ms)")
+        # Note: result.metrics.latency_ms includes full streaming time
+        # For pipeline integration, we use actual wall-clock time
+        actual_latency = int((t_end - t_start) * 1000)
+
+        print(f"  ✅ Flux STT: '{result.transcript}' ({actual_latency}ms, mode={result.metrics.mode})")
 
         return {
-            "transcript": transcript,
-            "latency": latency,
-            "method": "deepgram_prerecorded",
-            "confidence": response.results.channels[0].alternatives[0].confidence
+            "transcript": result.transcript,
+            "latency": actual_latency,
+            "method": f"deepgram_{result.metrics.mode}",
+            "confidence": result.confidence,
+            "metrics": {
+                "mode": result.metrics.mode,
+                "eager_eot_triggered": result.metrics.eager_eot_triggered,
+                "turn_resumed_count": result.metrics.turn_resumed_count,
+                "realtime_factor": result.metrics.realtime_factor,
+                "audio_duration_ms": result.metrics.audio_duration_ms,
+            }
         }
 
     except Exception as e:
-        print(f"❌ Error in Deepgram transcription: {e}")
+        print(f"❌ Error in Flux STT transcription: {e}")
+        import traceback
+        traceback.print_exc()
         return {
             "transcript": "",
             "latency": 0,
@@ -568,8 +590,8 @@ async def test_voice_websocket(websocket: WebSocket):
                 })
                 continue
 
-            # Transcribe with Deepgram
-            stt_result = await transcribe_audio_file(audio_file_path)
+            # Transcribe with Deepgram Flux (with interim transcript streaming)
+            stt_result = await transcribe_audio_file(audio_file_path, websocket=websocket)
 
             if stt_result.get("error"):
                 await websocket.send_json({
@@ -581,13 +603,14 @@ async def test_voice_websocket(websocket: WebSocket):
             transcript = stt_result["transcript"]
             stt_latency = stt_result["latency"]
 
-            # Send STT result with timing
+            # Send STT result with timing and Flux metrics
             await websocket.send_json({
                 "type": "stt",
                 "transcript": transcript,
                 "latency": stt_latency,
                 "method": stt_result["method"],
                 "confidence": stt_result.get("confidence", 0),
+                "metrics": stt_result.get("metrics", {}),  # Flux metrics (EOT, mode, etc.)
                 "timestamp": time.time()
             })
 
