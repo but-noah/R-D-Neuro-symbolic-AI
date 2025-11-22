@@ -64,6 +64,12 @@ interface ResponseResult {
   method: string;
 }
 
+interface ResponseAudioResult {
+  audio_b64: string;
+  size_kb: number;
+  latency: number;
+}
+
 interface MetricsResult {
   ttrs: number;
   stt_latency: number;
@@ -71,6 +77,7 @@ interface MetricsResult {
   filler_latency: number;
   logic_latency: number;
   response_latency: number;
+  tts_latency: number;
   total_latency: number;
   ttrs_target: number;
   ttrs_met: boolean;
@@ -81,7 +88,16 @@ export default function TestVoicePage() {
   const [connected, setConnected] = useState(false);
   const [testing, setTesting] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioQueueRef = useRef<HTMLAudioElement[]>([]);
+  const isPlayingRef = useRef(false);
+
+  // Web Audio API for PCM streaming
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const pcmBuffersRef = useRef<AudioBuffer[]>([]);
+  const isPlayingPCMRef = useRef(false);
+  const [ttsStreaming, setTTSStreaming] = useState(false);
+  const [ttsChunkCount, setTTSChunkCount] = useState(0);
+  const [ttsTTFB, setTTSTTFB] = useState<number | null>(null);
 
   // Test configuration
   const [selectedAudio, setSelectedAudio] = useState(TEST_AUDIO_FILES[0].value);
@@ -93,9 +109,130 @@ export default function TestVoicePage() {
   const [fillerResult, setFillerResult] = useState<FillerResult | null>(null);
   const [logicResult, setLogicResult] = useState<LogicResult | null>(null);
   const [responseResult, setResponseResult] = useState<ResponseResult | null>(null);
+  const [responseAudioResult, setResponseAudioResult] = useState<ResponseAudioResult | null>(null);
   const [metricsResult, setMetricsResult] = useState<MetricsResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [ttrsUpdate, setTTRSUpdate] = useState<{ttrs: number; ttrs_met: boolean} | null>(null);
+
+  // Audio playback queue management
+  const playAudioQueue = async () => {
+    if (isPlayingRef.current || audioQueueRef.current.length === 0) {
+      return;
+    }
+
+    isPlayingRef.current = true;
+
+    while (audioQueueRef.current.length > 0) {
+      const audio = audioQueueRef.current.shift()!;
+
+      // Play audio and wait for it to finish
+      await new Promise<void>((resolve) => {
+        audio.onended = () => resolve();
+        audio.onerror = () => resolve();
+        audio.play().catch((e) => {
+          console.error("Error playing audio:", e);
+          resolve();
+        });
+      });
+    }
+
+    isPlayingRef.current = false;
+  };
+
+  const addToAudioQueue = (audioB64: string) => {
+    try {
+      // Convert base64 to blob
+      const binaryString = atob(audioB64);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      const blob = new Blob([bytes], { type: "audio/mp3" });
+      const url = URL.createObjectURL(blob);
+
+      // Create audio element
+      const audio = new Audio(url);
+      audioQueueRef.current.push(audio);
+
+      // Start playing queue
+      playAudioQueue();
+    } catch (error) {
+      console.error("Error adding audio to queue:", error);
+    }
+  };
+
+  // Initialize Web Audio Context
+  const initAudioContext = () => {
+    if (!audioContextRef.current) {
+      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+    }
+  };
+
+  // Handle PCM audio chunk
+  const handlePCMChunk = async (audioB64: string, sampleRate: number) => {
+    try {
+      initAudioContext();
+
+      // Decode base64 to ArrayBuffer
+      const binaryString = atob(audioB64);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+
+      // Convert PCM int16 to float32
+      const pcmData = new Int16Array(bytes.buffer);
+      const audioBuffer = audioContextRef.current!.createBuffer(
+        1, // mono
+        pcmData.length,
+        sampleRate
+      );
+
+      const channelData = audioBuffer.getChannelData(0);
+      for (let i = 0; i < pcmData.length; i++) {
+        channelData[i] = pcmData[i] / 32768.0; // Convert int16 to float32
+      }
+
+      // Add to buffer queue
+      pcmBuffersRef.current.push(audioBuffer);
+
+      // Start playing if not already
+      if (!isPlayingPCMRef.current) {
+        playPCMBuffers();
+      }
+    } catch (error) {
+      console.error("Error handling PCM chunk:", error);
+    }
+  };
+
+  // Play PCM audio buffers in sequence
+  const playPCMBuffers = () => {
+    if (isPlayingPCMRef.current || pcmBuffersRef.current.length === 0 || !audioContextRef.current) {
+      return;
+    }
+
+    isPlayingPCMRef.current = true;
+
+    const playNextBuffer = () => {
+      if (pcmBuffersRef.current.length === 0) {
+        isPlayingPCMRef.current = false;
+        return;
+      }
+
+      const buffer = pcmBuffersRef.current.shift()!;
+      const source = audioContextRef.current!.createBufferSource();
+      source.buffer = buffer;
+      source.connect(audioContextRef.current!.destination);
+
+      source.onended = () => {
+        playNextBuffer();
+      };
+
+      source.start();
+    };
+
+    playNextBuffer();
+  };
 
   // Connect to WebSocket
   const handleConnect = () => {
@@ -154,8 +291,8 @@ export default function TestVoicePage() {
             size_kb: data.size_kb,
             latency: data.latency,
           });
-          // Auto-play filler audio
-          playFillerAudio(data.audio_b64);
+          // Add filler audio to queue
+          addToAudioQueue(data.audio_b64);
           break;
 
         case "logic":
@@ -166,12 +303,51 @@ export default function TestVoicePage() {
           });
           break;
 
-        case "response":
+        case "response_text":
           setResponseResult({
             text: data.text,
             latency: data.latency,
             method: data.method,
           });
+          break;
+
+        case "response_audio":
+          setResponseAudioResult({
+            audio_b64: data.audio_b64,
+            size_kb: data.size_kb,
+            latency: data.latency,
+          });
+          // Add response audio to queue
+          addToAudioQueue(data.audio_b64);
+          break;
+
+        case "tts_chunk":
+          // Handle streaming PCM audio chunk
+          if (data.chunk_number === 1) {
+            setTTSStreaming(true);
+            setTTSTTFB(null);
+            console.log("🎵 TTS streaming started...");
+          }
+          setTTSChunkCount(data.chunk_number);
+          handlePCMChunk(data.audio_b64, data.sample_rate);
+          break;
+
+        case "tts_complete":
+          // TTS streaming complete
+          setTTSStreaming(false);
+          setTTSTTFB(data.ttfb);
+          setResponseAudioResult({
+            audio_b64: "", // Not applicable for streaming
+            size_kb: data.total_bytes / 1024,
+            latency: data.total_latency,
+          });
+          console.log(`✅ TTS streaming complete: ${data.chunk_count} chunks, TTFB: ${data.ttfb}ms, Total: ${data.total_latency}ms`);
+          break;
+
+        case "tts_error":
+          setTTSStreaming(false);
+          console.error("❌ TTS error:", data.error);
+          setError(`TTS error: ${data.error}`);
           break;
 
         case "ttrs_update":
@@ -207,28 +383,6 @@ export default function TestVoicePage() {
     wsRef.current = ws;
   };
 
-  // Play filler audio from base64
-  const playFillerAudio = (audioB64: string) => {
-    try {
-      // Convert base64 to blob
-      const binaryString = atob(audioB64);
-      const bytes = new Uint8Array(binaryString.length);
-      for (let i = 0; i < binaryString.length; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
-      }
-      const blob = new Blob([bytes], { type: "audio/mp3" });
-      const url = URL.createObjectURL(blob);
-
-      // Play audio
-      if (audioRef.current) {
-        audioRef.current.src = url;
-        audioRef.current.play();
-      }
-    } catch (error) {
-      console.error("Error playing filler audio:", error);
-    }
-  };
-
   // Run test
   const handleTest = () => {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
@@ -243,10 +397,15 @@ export default function TestVoicePage() {
     setFillerResult(null);
     setLogicResult(null);
     setResponseResult(null);
+    setResponseAudioResult(null);
     setMetricsResult(null);
     setTTRSUpdate(null);
     setError(null);
     setTesting(true);
+
+    // Clear audio queue
+    audioQueueRef.current = [];
+    isPlayingRef.current = false;
 
     // Send test request
     wsRef.current.send(
@@ -529,8 +688,11 @@ export default function TestVoicePage() {
                     {fillerResult.latency.toFixed(2)}ms
                   </span>
                 </div>
-                <div className="mt-4">
-                  <audio ref={audioRef} controls className="w-full" />
+                <div className="mt-4 flex items-center justify-center">
+                  <div className="text-blue-400 flex items-center space-x-2">
+                    <div className="w-2 h-2 bg-blue-500 rounded-full animate-pulse"></div>
+                    <span className="text-sm">Playing filler audio...</span>
+                  </div>
                 </div>
               </div>
             </div>
@@ -608,16 +770,36 @@ export default function TestVoicePage() {
                 <div className="bg-gray-900 rounded-lg p-4">
                   <p className="text-gray-300">{responseResult.text}</p>
                 </div>
-                <div className="flex justify-between text-sm">
+                <div className="grid grid-cols-2 gap-4 text-sm">
                   <div>
-                    <span className="text-gray-400">Latency:</span>
+                    <span className="text-gray-400">Text Generation:</span>
                     <span className="font-mono text-green-400 ml-2">{responseResult.latency}ms</span>
                   </div>
+                  {responseAudioResult && (
+                    <div>
+                      <span className="text-gray-400">TTS:</span>
+                      <span className="font-mono text-green-400 ml-2">{responseAudioResult.latency}ms</span>
+                    </div>
+                  )}
                   <div>
                     <span className="text-gray-400">Method:</span>
                     <span className="text-gray-300 ml-2">{responseResult.method}</span>
                   </div>
+                  {responseAudioResult && (
+                    <div>
+                      <span className="text-gray-400">Audio Size:</span>
+                      <span className="text-gray-300 ml-2">{responseAudioResult.size_kb.toFixed(1)} KB</span>
+                    </div>
+                  )}
                 </div>
+                {responseAudioResult && (
+                  <div className="mt-4 flex items-center justify-center">
+                    <div className="text-blue-400 flex items-center space-x-2">
+                      <div className="w-2 h-2 bg-blue-500 rounded-full animate-pulse"></div>
+                      <span className="text-sm">Playing response audio...</span>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -680,6 +862,14 @@ export default function TestVoicePage() {
                   <div className="text-xs text-gray-400 mb-1">Response Generation</div>
                   <div className="text-2xl font-bold text-orange-400">
                     {metricsResult.response_latency}ms
+                  </div>
+                </div>
+
+                {/* TTS */}
+                <div className="bg-gray-900 rounded-lg p-4">
+                  <div className="text-xs text-gray-400 mb-1">Text-to-Speech</div>
+                  <div className="text-2xl font-bold text-indigo-400">
+                    {metricsResult.tts_latency}ms
                   </div>
                 </div>
 

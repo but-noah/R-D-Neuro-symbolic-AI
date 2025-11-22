@@ -3,20 +3,23 @@ Test Voice Pipeline WebSocket Endpoint
 Real-time voice pipeline testing with live updates
 
 This endpoint enables testing the complete voice pipeline with:
-- Mock STT (realistic delays, pre-defined transcripts)
-- REAL Emotion Detection (OpenAI API)
+- REAL Deepgram STT (pre-recorded test audio files)
+- REAL Emotion Detection (hybrid: fast keyword + parallel LLM)
 - REAL Filler Selection (memory-cached audio)
 - REAL Rules Engine (test orders database)
 - REAL Response Generation (OpenAI API)
+- REAL Cartesia TTS (text-to-speech)
 
 Flow:
 1. Client selects test audio file
-2. Server streams updates for each phase:
-   - STT transcript
-   - Emotion detection
-   - Filler selection
+2. Server loads MP3 and sends to Deepgram for transcription
+3. Partial results trigger pipeline early
+4. Server streams updates for each phase:
+   - STT transcript (partial + final)
+   - Emotion detection (fast + LLM)
+   - Filler selection + audio
    - Logic execution
-   - Response generation
+   - Response generation + TTS audio
    - Performance metrics
 """
 
@@ -25,9 +28,12 @@ import asyncio
 import time
 import base64
 import re
-from typing import Dict, Any
+import json
+from typing import Dict, Any, Optional
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from openai import AsyncOpenAI
+from deepgram import DeepgramClient
+from cartesia import AsyncCartesia
 
 # Import our services
 from app.services.filler_loader import get_filler_loader
@@ -35,24 +41,24 @@ from app.services.rules_engine import check_refund_eligibility_with_order_id
 
 router = APIRouter()
 
-# Initialize OpenAI client
+# Initialize API clients
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY")
+
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+deepgram_client = DeepgramClient(api_key=DEEPGRAM_API_KEY) if DEEPGRAM_API_KEY else None
+cartesia_client = AsyncCartesia(api_key=CARTESIA_API_KEY) if CARTESIA_API_KEY else None
 
-# Pre-defined transcripts for test files (from generate_test_queries.py)
-MOCK_TRANSCRIPTS = {
-    "neutral_test_001.mp3": "Hi, I'm calling about a refund for order number 12345. I received the wrong item and would like to return it. Can you help me with this?",
-    "neutral_test_002.mp3": "Hello, I ordered a product last week but it hasn't arrived yet. Could you check the status of my delivery? The order number is 67890.",
-    "neutral_test_003.mp3": "Good morning, I'd like to request a refund for a purchase I made. The product doesn't quite meet my needs. What's the process for returning it?",
+# Cartesia voice configuration
+CARTESIA_VOICE_ID = "a0e99841-438c-4a64-b679-ae501e7d6091"  # Conversational English voice
+CARTESIA_MODEL = "sonic-english"
 
-    "angry_medium_test_001.mp3": "Look, I've been waiting three weeks for my refund for order 12345 and I still haven't received it. This is getting really frustrating. I was promised it would be processed within five business days. Can someone please tell me what's going on?",
-    "angry_medium_test_002.mp3": "I'm pretty upset about this situation with order 67890. The item I received is damaged and I've already contacted support twice. Nobody seems to be helping me. I just want my money back or a replacement.",
-    "angry_medium_test_003.mp3": "This is the second time I'm calling about order 11111. I was told last week that my refund would be processed, but nothing happened. I'm starting to lose patience here. When exactly will I get my refund?",
+# Cartesia WebSocket connection (reusable)
+cartesia_ws = None
 
-    "angry_high_test_001.mp3": "This is absolutely unacceptable! I've been waiting over a month for my refund for order 12345 and I keep getting the runaround! Every time I call, I get a different excuse. I want my money back RIGHT NOW or I'm filing a complaint with consumer protection!",
-    "angry_high_test_002.mp3": "I am EXTREMELY frustrated with your service! The product from order 22222 arrived broken, your support team has been completely unhelpful, and now you're telling me I can't get a refund?! This is ridiculous! I demand to speak to a manager immediately!",
-    "angry_high_test_003.mp3": "I have had it with your company! This is the FOURTH time I'm calling about this refund for order 77777! I've wasted hours on hold, been transferred multiple times, and STILL no resolution! Either you process my refund today or I'm taking legal action!",
-}
+# Test audio directory
+TEST_AUDIO_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "..", "test_audio")
 
 
 async def detect_emotion_real(transcript: str) -> Dict[str, Any]:
@@ -267,7 +273,7 @@ async def generate_response_real(
             tone = "friendly and helpful"
 
         # Build context
-        order_details = decision.get("order_details", {})
+        order_details = decision.get("order_details") or {}
         product_name = order_details.get("product_name", "your order")
 
         system_prompt = f"""You are a customer service agent for an e-commerce company.
@@ -324,7 +330,7 @@ async def generate_response_real(
 
 def generate_response_mock(decision: Dict[str, Any], emotion: Dict[str, Any]) -> Dict[str, Any]:
     """Mock response generation (fallback)"""
-    order_details = decision.get("order_details", {})
+    order_details = decision.get("order_details") or {}
     product_name = order_details.get("product_name", "your product")
     amount = decision["amount"]
 
@@ -343,6 +349,166 @@ def generate_response_mock(decision: Dict[str, Any], emotion: Dict[str, Any]) ->
         "latency": 1,
         "method": "template_mock"
     }
+
+
+async def transcribe_audio_file(audio_file_path: str) -> Dict[str, Any]:
+    """
+    Transcribe audio file using Deepgram API
+
+    Args:
+        audio_file_path: Path to audio file (MP3)
+
+    Returns:
+        Dict with transcript and latency
+    """
+    if not deepgram_client:
+        return {
+            "transcript": "",
+            "latency": 0,
+            "method": "unavailable",
+            "error": "Deepgram client not available"
+        }
+
+    t_start = time.time()
+
+    try:
+        # Read audio file
+        with open(audio_file_path, 'rb') as audio_file:
+            audio_data = audio_file.read()
+
+        # Transcribe using Deepgram prerecorded API (Nova-3 for highest accuracy)
+        # Note: Flux is only for live streaming WebSockets
+        response = deepgram_client.listen.v1.media.transcribe_file(
+            request=audio_data,
+            model="nova-3",
+            language="en-US",
+            smart_format=True,
+            punctuate=True,
+            diarize=False
+        )
+
+        # Extract transcript
+        transcript = response.results.channels[0].alternatives[0].transcript
+
+        t_end = time.time()
+        latency = int((t_end - t_start) * 1000)
+
+        print(f"  ✅ Deepgram transcribed: '{transcript}' ({latency}ms)")
+
+        return {
+            "transcript": transcript,
+            "latency": latency,
+            "method": "deepgram_prerecorded",
+            "confidence": response.results.channels[0].alternatives[0].confidence
+        }
+
+    except Exception as e:
+        print(f"❌ Error in Deepgram transcription: {e}")
+        return {
+            "transcript": "",
+            "latency": 0,
+            "method": "error",
+            "error": str(e)
+        }
+
+
+async def synthesize_speech_streaming(text: str, websocket: WebSocket, emotion_category: str):
+    """
+    Convert text to speech using Cartesia WebSocket TTS with real-time streaming
+
+    Args:
+        text: Text to synthesize
+        websocket: WebSocket connection to stream audio chunks
+        emotion_category: "calm", "angry_medium", or "angry_high"
+    """
+    if not cartesia_client:
+        print("⚠️  Cartesia client not available")
+        await websocket.send_json({
+            "type": "tts_error",
+            "error": "Cartesia client not available"
+        })
+        return
+
+    t_start = time.time()
+    first_chunk_time = None
+    chunk_count = 0
+    total_bytes = 0
+
+    try:
+        print(f"  📡 Starting Cartesia WebSocket TTS stream...", flush=True)
+
+        # Initialize WebSocket connection (await the coroutine)
+        ws = await cartesia_client.tts.websocket()
+
+        # Send TTS request and get the streaming generator
+        output_generate = await ws.send(
+            model_id=CARTESIA_MODEL,
+            transcript=text,
+            voice={"mode": "id", "id": CARTESIA_VOICE_ID},
+            stream=True,
+            output_format={
+                "container": "raw",
+                "encoding": "pcm_s16le",  # 16-bit PCM
+                "sample_rate": 22050,
+            },
+            language="en",
+        )
+
+        # Stream audio chunks
+        async for chunk in output_generate:
+            if chunk_count == 0:
+                first_chunk_time = time.time()
+                ttfb = int((first_chunk_time - t_start) * 1000)
+                print(f"  ⚡ First chunk received: {ttfb}ms (TTFB)", flush=True)
+
+            # Get audio data from chunk
+            audio_data = chunk.get("audio") if isinstance(chunk, dict) else getattr(chunk, "audio", None)
+
+            if audio_data:
+                chunk_bytes = len(audio_data)
+                total_bytes += chunk_bytes
+                chunk_count += 1
+
+                # Convert raw PCM bytes to base64 for transmission
+                audio_b64 = base64.b64encode(audio_data).decode('utf-8')
+
+                # Stream chunk to frontend
+                await websocket.send_json({
+                    "type": "tts_chunk",
+                    "audio_b64": audio_b64,
+                    "chunk_number": chunk_count,
+                    "chunk_size": chunk_bytes,
+                    "encoding": "pcm_s16le",
+                    "sample_rate": 22050,
+                })
+
+        # Close the Cartesia WebSocket
+        ws.close()
+
+        t_end = time.time()
+        total_latency = int((t_end - t_start) * 1000)
+        ttfb = int((first_chunk_time - t_start) * 1000) if first_chunk_time else 0
+
+        print(f"  ✅ TTS stream complete: {chunk_count} chunks, {total_bytes} bytes", flush=True)
+        print(f"     TTFB: {ttfb}ms, Total: {total_latency}ms", flush=True)
+
+        # Send completion signal
+        await websocket.send_json({
+            "type": "tts_complete",
+            "chunk_count": chunk_count,
+            "total_bytes": total_bytes,
+            "ttfb": ttfb,
+            "total_latency": total_latency,
+        })
+
+    except Exception as e:
+        print(f"  ❌ Error in TTS streaming: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        await websocket.send_json({
+            "type": "tts_error",
+            "error": str(e)
+        })
 
 
 @router.websocket("/ws/test-voice")
@@ -383,29 +549,41 @@ async def test_voice_websocket(websocket: WebSocket):
             t_ttrs_start = t_pipeline_start
 
             # ================================================================
-            # PHASE 1: Speech-to-Text (Mock with realistic delay)
+            # PHASE 1: Speech-to-Text (REAL Deepgram!)
             # ================================================================
-            print("  Phase 1: STT...")
+            print("  Phase 1: STT (Deepgram)...")
             t_stt_start = time.time()
 
-            # Simulate STT latency (300ms realistic for Deepgram)
-            await asyncio.sleep(0.3)
+            # Build path to audio file
+            audio_file_path = os.path.join(TEST_AUDIO_DIR, audio_file)
 
-            # Get transcript from mock database
-            transcript = MOCK_TRANSCRIPTS.get(
-                audio_file,
-                "Test query for voice pipeline testing."
-            )
+            if not os.path.exists(audio_file_path):
+                await websocket.send_json({
+                    "type": "error",
+                    "message": f"Audio file not found: {audio_file}"
+                })
+                continue
 
-            t_stt_end = time.time()
-            stt_latency = int((t_stt_end - t_stt_start) * 1000)
+            # Transcribe with Deepgram
+            stt_result = await transcribe_audio_file(audio_file_path)
+
+            if stt_result.get("error"):
+                await websocket.send_json({
+                    "type": "error",
+                    "message": f"STT error: {stt_result['error']}"
+                })
+                continue
+
+            transcript = stt_result["transcript"]
+            stt_latency = stt_result["latency"]
 
             # Send STT result with timing
             await websocket.send_json({
                 "type": "stt",
                 "transcript": transcript,
                 "latency": stt_latency,
-                "method": "mock_realistic",
+                "method": stt_result["method"],
+                "confidence": stt_result.get("confidence", 0),
                 "timestamp": time.time()
             })
 
@@ -535,14 +713,26 @@ async def test_voice_websocket(websocket: WebSocket):
             t_response_end = time.time()
 
             await websocket.send_json({
-                "type": "response",
+                "type": "response_text",
                 **response,
                 "timestamp": t_response_end,
                 "emotion_used": emotion_for_response["method"]
             })
 
             # ================================================================
-            # PHASE 6: Performance Metrics
+            # PHASE 6: Text-to-Speech (REAL - Cartesia WebSocket Streaming!)
+            # ================================================================
+            print("  Phase 6: Text-to-Speech (Cartesia WebSocket Streaming)...", flush=True)
+
+            # Stream TTS audio in real-time
+            await synthesize_speech_streaming(
+                response["text"],
+                websocket,
+                emotion_for_response["category"]
+            )
+
+            # ================================================================
+            # PHASE 7: Performance Metrics
             # ================================================================
             t_pipeline_end = time.time()
             total_latency = int((t_pipeline_end - t_pipeline_start) * 1000)
@@ -555,6 +745,7 @@ async def test_voice_websocket(websocket: WebSocket):
                 "filler_latency": round(filler_latency, 2),
                 "logic_latency": logic_latency,
                 "response_latency": response["latency"],
+                "tts_latency": tts_latency,
                 "total_latency": total_latency,
                 "ttrs_target": 840,
                 "ttrs_met": ttrs < 840
