@@ -543,8 +543,10 @@ async def test_voice_websocket(websocket: WebSocket):
     Test Voice Pipeline WebSocket Endpoint
 
     Protocol:
-    1. Client sends: {"audio_file": "angry_high_test_001.mp3"}
-    2. Server streams JSON updates:
+    1. File Mode: Client sends: {"audio_file": "angry_high_test_001.mp3"}
+    2. Live Mode: Client sends chunks: {"type": "audio_chunk", "audio_data": "base64..."}
+                 Then sends: {"type": "audio_complete", "audio_data": "base64..."}
+    3. Server streams JSON updates:
        - {"type": "stt", "transcript": "...", "latency": 301}
        - {"type": "emotion", "anger": 0.85, "category": "angry_high", ...}
        - {"type": "filler", "category": "angry_high", "audio_b64": "...", ...}
@@ -555,20 +557,102 @@ async def test_voice_websocket(websocket: WebSocket):
     await websocket.accept()
     print("🔌 Test voice client connected")
 
+    # Storage for live audio chunks
+    live_audio_chunks = []
+
     try:
         while True:
             # Receive request from client
             data = await websocket.receive_json()
-            audio_file = data.get("audio_file")
 
-            if not audio_file:
-                await websocket.send_json({
-                    "type": "error",
-                    "message": "No audio_file specified"
-                })
+            message_type = data.get("type")
+
+            # Handle live audio chunks
+            if message_type == "audio_chunk":
+                # Accumulate audio chunk
+                audio_data_b64 = data.get("audio_data")
+                if audio_data_b64:
+                    live_audio_chunks.append(audio_data_b64)
+                    print(f"📦 Received audio chunk {len(live_audio_chunks)}")
                 continue
 
-            print(f"🎤 Testing pipeline with: {audio_file}")
+            elif message_type == "audio_complete":
+                # Final audio received - combine all chunks and process
+                print(f"🎤 Live recording complete: {len(live_audio_chunks)} chunks received")
+
+                if len(live_audio_chunks) == 0:
+                    print("⚠️  No audio chunks received")
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "No audio data received"
+                    })
+                    continue
+
+                # Decode and combine all audio chunks
+                combined_audio = b""
+                for chunk_b64 in live_audio_chunks:
+                    try:
+                        combined_audio += base64.b64decode(chunk_b64)
+                    except Exception as e:
+                        print(f"❌ Error decoding chunk: {e}")
+                        continue
+
+                if len(combined_audio) == 0:
+                    print("⚠️  Combined audio is empty")
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "Failed to decode audio data"
+                    })
+                    live_audio_chunks = []
+                    continue
+
+                # Save to temporary file
+                import tempfile
+                temp_fd, temp_path = tempfile.mkstemp(suffix=".webm")
+                try:
+                    os.write(temp_fd, combined_audio)
+                    os.close(temp_fd)
+
+                    print(f"💾 Saved {len(combined_audio)} bytes to {temp_path}")
+
+                    # Process the temporary file through the pipeline
+                    audio_file_path = temp_path
+                    print(f"🎤 Processing live recording through pipeline...")
+
+                except Exception as e:
+                    print(f"❌ Error saving audio: {e}")
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": f"Failed to save audio: {str(e)}"
+                    })
+                    live_audio_chunks = []
+                    continue
+                finally:
+                    # Clear chunks for next recording
+                    live_audio_chunks = []
+
+            else:
+                # File mode - original behavior
+                audio_file = data.get("audio_file")
+
+                if not audio_file:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "No audio_file specified"
+                    })
+                    continue
+
+                print(f"🎤 Testing pipeline with: {audio_file}")
+
+                # Build path to audio file
+                audio_file_path = os.path.join(TEST_AUDIO_DIR, audio_file)
+
+                if not os.path.exists(audio_file_path):
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": f"Audio file not found: {audio_file}"
+                    })
+                    continue
 
             # Track overall timing
             t_pipeline_start = time.time()
@@ -580,18 +664,16 @@ async def test_voice_websocket(websocket: WebSocket):
             print("  Phase 1: STT (Deepgram)...")
             t_stt_start = time.time()
 
-            # Build path to audio file
-            audio_file_path = os.path.join(TEST_AUDIO_DIR, audio_file)
-
-            if not os.path.exists(audio_file_path):
-                await websocket.send_json({
-                    "type": "error",
-                    "message": f"Audio file not found: {audio_file}"
-                })
-                continue
-
             # Transcribe with Deepgram Flux (with interim transcript streaming)
             stt_result = await transcribe_audio_file(audio_file_path, websocket=websocket)
+
+            # Clean up temporary file if it was created
+            if message_type == "audio_complete" and os.path.exists(audio_file_path):
+                try:
+                    os.unlink(audio_file_path)
+                    print(f"🗑️  Cleaned up temporary file: {audio_file_path}")
+                except Exception as e:
+                    print(f"⚠️  Failed to clean up temp file: {e}")
 
             if stt_result.get("error"):
                 await websocket.send_json({

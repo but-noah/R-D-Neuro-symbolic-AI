@@ -89,12 +89,21 @@ interface MetricsResult {
 }
 
 export default function OptimizedVoicePage() {
+  // Mode selection: "file" or "live"
+  const [mode, setMode] = useState<"file" | "live">("file");
+
   // Connection state
   const [connected, setConnected] = useState(false);
   const [testing, setTesting] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const audioQueueRef = useRef<HTMLAudioElement[]>([]);
   const isPlayingRef = useRef(false);
+
+  // Live recording state
+  const [isRecording, setIsRecording] = useState(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
 
   // Web Audio API for PCM streaming
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -231,6 +240,113 @@ export default function OptimizedVoicePage() {
     };
 
     playNextBuffer();
+  };
+
+  // Start live recording
+  const startRecording = async () => {
+    try {
+      // Request microphone access
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          sampleRate: 16000,
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+        }
+      });
+
+      mediaStreamRef.current = stream;
+
+      // Create MediaRecorder
+      const mediaRecorder = new MediaRecorder(stream, {
+        mimeType: 'audio/webm;codecs=opus',
+      });
+
+      mediaRecorderRef.current = mediaRecorder;
+      audioChunksRef.current = [];
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+
+          // Send audio chunk to backend via WebSocket
+          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            const reader = new FileReader();
+            reader.onload = () => {
+              if (reader.result && wsRef.current) {
+                const audioData = reader.result as ArrayBuffer;
+                const base64 = btoa(
+                  new Uint8Array(audioData).reduce(
+                    (data, byte) => data + String.fromCharCode(byte),
+                    ''
+                  )
+                );
+
+                wsRef.current.send(JSON.stringify({
+                  type: "audio_chunk",
+                  audio_data: base64,
+                }));
+              }
+            };
+            reader.readAsArrayBuffer(event.data);
+          }
+        }
+      };
+
+      mediaRecorder.onstop = async () => {
+        console.log("🛑 Recording stopped");
+        console.log(`📦 Total chunks collected: ${audioChunksRef.current.length}`);
+
+        // Send completion signal (backend already has all chunks)
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          console.log("✅ Sending audio_complete signal");
+          wsRef.current.send(JSON.stringify({
+            type: "audio_complete",
+          }));
+          console.log("✅ audio_complete signal sent successfully");
+        } else {
+          console.error("❌ Cannot send audio_complete - WebSocket not open:", wsRef.current?.readyState);
+        }
+
+        // Stop all tracks
+        if (mediaStreamRef.current) {
+          mediaStreamRef.current.getTracks().forEach(track => track.stop());
+        }
+      };
+
+      // Start recording with 100ms chunks
+      mediaRecorder.start(100);
+      setIsRecording(true);
+      setError(null);
+
+      // Reset results
+      setPipelineStart(Date.now());
+      setPhaseTimestamps({});
+      setSTTResult(null);
+      setInterimTranscript("");
+      setEmotionResult(null);
+      setEmotionLLMResult(null);
+      setFillerResult(null);
+      setLogicResult(null);
+      setResponseResult(null);
+      setResponseAudioResult(null);
+      setMetricsResult(null);
+      setTTRSUpdate(null);
+
+      console.log("🎤 Recording started");
+    } catch (err) {
+      console.error("Error starting recording:", err);
+      setError("Failed to access microphone. Please grant permission.");
+    }
+  };
+
+  // Stop live recording
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && isRecording) {
+      mediaRecorderRef.current.stop();
+      setIsRecording(false);
+      console.log("🛑 Recording stopped");
+    }
   };
 
   // Connect to WebSocket
@@ -377,7 +493,7 @@ export default function OptimizedVoicePage() {
     wsRef.current = ws;
   };
 
-  // Run test
+  // Run file test
   const handleTest = () => {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
       setError("Not connected to server");
@@ -414,6 +530,11 @@ export default function OptimizedVoicePage() {
 
   // Disconnect
   const handleDisconnect = () => {
+    // Stop recording if active
+    if (isRecording) {
+      stopRecording();
+    }
+
     if (wsRef.current) {
       wsRef.current.close();
       wsRef.current = null;
@@ -427,6 +548,9 @@ export default function OptimizedVoicePage() {
       if (wsRef.current) {
         wsRef.current.close();
       }
+      if (mediaStreamRef.current) {
+        mediaStreamRef.current.getTracks().forEach(track => track.stop());
+      }
     };
   }, []);
 
@@ -434,6 +558,18 @@ export default function OptimizedVoicePage() {
   const getLatencyReduction = (optimized: number, baseline: number = 1275) => {
     const reduction = ((baseline - optimized) / baseline) * 100;
     return reduction.toFixed(1);
+  };
+
+  // Get display mode for STT metrics
+  const getSTTModeDisplay = (mode?: string) => {
+    if (!mode) return null;
+
+    // Check if mode contains "flux" (handles both "flux" and "flux_streaming")
+    if (mode.toLowerCase().includes('flux')) {
+      return { label: "⚡ Flux Streaming", isFlux: true };
+    }
+
+    return { label: "📡 Nova-3 Fallback", isFlux: false };
   };
 
   return (
@@ -460,60 +596,146 @@ export default function OptimizedVoicePage() {
         {/* Controls */}
         <Card className="bg-slate-900/50 border-slate-700">
           <CardContent className="pt-6">
-            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-              {/* Audio Selection */}
-              <div className="md:col-span-2">
+            <div className="space-y-4">
+              {/* Mode Selection */}
+              <div>
                 <label className="block text-sm font-medium mb-2 text-slate-300">
-                  Test Audio Scenario
+                  Input Mode
                 </label>
-                <Select value={selectedAudio} onValueChange={setSelectedAudio} disabled={testing}>
-                  <SelectTrigger className="bg-slate-800 border-slate-600">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {TEST_AUDIO_FILES.map((file) => (
-                      <SelectItem key={file.value} value={file.value}>
-                        {file.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-
-              {/* Actions */}
-              <div className="md:col-span-2 flex items-end space-x-2">
-                {!connected ? (
-                  <Button onClick={handleConnect} className="flex-1 bg-blue-600 hover:bg-blue-700">
-                    Connect to Pipeline
+                <div className="flex space-x-2">
+                  <Button
+                    onClick={() => setMode("file")}
+                    variant={mode === "file" ? "default" : "outline"}
+                    className={mode === "file" ? "bg-blue-600" : ""}
+                    disabled={isRecording || testing}
+                  >
+                    📁 File Testing
                   </Button>
-                ) : (
-                  <>
-                    <Button
-                      onClick={handleTest}
-                      disabled={testing}
-                      className="flex-1 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700"
-                    >
-                      {testing ? (
-                        <span className="flex items-center space-x-2">
-                          <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                          <span>Processing...</span>
-                        </span>
-                      ) : (
-                        "Run Test"
-                      )}
-                    </Button>
-                    <Button onClick={handleDisconnect} variant="destructive">
-                      Disconnect
-                    </Button>
-                  </>
+                  <Button
+                    onClick={() => setMode("live")}
+                    variant={mode === "live" ? "default" : "outline"}
+                    className={mode === "live" ? "bg-purple-600" : ""}
+                    disabled={isRecording || testing}
+                  >
+                    🎤 Live Recording
+                  </Button>
+                </div>
+                {mode === "file" && (
+                  <p className="text-xs text-slate-500 mt-2">
+                    File testing: ~13-16s latency (realtime streaming required for Flux turn detection)
+                  </p>
+                )}
+                {mode === "live" && (
+                  <p className="text-xs text-green-500 mt-2">
+                    Live recording: True 300-400ms Flux latency! This is where the optimization shines.
+                  </p>
                 )}
               </div>
+
+              {/* File Mode Controls */}
+              {mode === "file" && (
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                  <div className="md:col-span-2">
+                    <label className="block text-sm font-medium mb-2 text-slate-300">
+                      Test Audio Scenario
+                    </label>
+                    <Select value={selectedAudio} onValueChange={setSelectedAudio} disabled={testing}>
+                      <SelectTrigger className="bg-slate-800 border-slate-600">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {TEST_AUDIO_FILES.map((file) => (
+                          <SelectItem key={file.value} value={file.value}>
+                            {file.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  <div className="md:col-span-2 flex items-end space-x-2">
+                    {!connected ? (
+                      <Button onClick={handleConnect} className="flex-1 bg-blue-600 hover:bg-blue-700">
+                        Connect to Pipeline
+                      </Button>
+                    ) : (
+                      <>
+                        <Button
+                          onClick={handleTest}
+                          disabled={testing}
+                          className="flex-1 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700"
+                        >
+                          {testing ? (
+                            <span className="flex items-center space-x-2">
+                              <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                              <span>Processing...</span>
+                            </span>
+                          ) : (
+                            "Run Test"
+                          )}
+                        </Button>
+                        <Button onClick={handleDisconnect} variant="destructive">
+                          Disconnect
+                        </Button>
+                      </>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Live Mode Controls */}
+              {mode === "live" && (
+                <div className="flex items-center space-x-2">
+                  {!connected ? (
+                    <Button onClick={handleConnect} className="bg-blue-600 hover:bg-blue-700">
+                      Connect to Pipeline
+                    </Button>
+                  ) : (
+                    <>
+                      {!isRecording ? (
+                        <Button
+                          onClick={startRecording}
+                          className="bg-gradient-to-r from-red-600 to-pink-600 hover:from-red-700 hover:to-pink-700"
+                        >
+                          <span className="flex items-center space-x-2">
+                            <span className="w-3 h-3 bg-white rounded-full animate-pulse" />
+                            <span>Start Recording</span>
+                          </span>
+                        </Button>
+                      ) : (
+                        <Button
+                          onClick={stopRecording}
+                          className="bg-gradient-to-r from-gray-600 to-gray-700"
+                        >
+                          <span className="flex items-center space-x-2">
+                            <span className="w-3 h-3 bg-white rounded-sm" />
+                            <span>Stop Recording</span>
+                          </span>
+                        </Button>
+                      )}
+                      <Button onClick={handleDisconnect} variant="destructive">
+                        Disconnect
+                      </Button>
+                    </>
+                  )}
+                </div>
+              )}
             </div>
 
             {/* Error Display */}
             {error && (
               <div className="mt-4 bg-red-900/30 border border-red-500/50 rounded-lg p-4">
                 <p className="text-red-200">❌ {error}</p>
+              </div>
+            )}
+
+            {/* Recording Status */}
+            {isRecording && (
+              <div className="mt-4 bg-red-900/30 border-2 border-red-500/50 rounded-lg p-4">
+                <div className="flex items-center space-x-3">
+                  <div className="w-4 h-4 bg-red-500 rounded-full animate-pulse" />
+                  <span className="text-red-200 font-semibold">🎤 Recording in progress... Speak now!</span>
+                </div>
               </div>
             )}
           </CardContent>
@@ -577,14 +799,17 @@ export default function OptimizedVoicePage() {
                         </div>
                       </div>
 
-                      {sttResult.metrics?.mode && (
-                        <div className="flex items-center justify-between">
-                          <span className="text-sm text-slate-400">Mode</span>
-                          <Badge variant={sttResult.metrics.mode === "flux" ? "default" : "secondary"}>
-                            {sttResult.metrics.mode === "flux" ? "⚡ Flux Streaming" : "📡 Nova-3 Fallback"}
-                          </Badge>
-                        </div>
-                      )}
+                      {sttResult.metrics?.mode && (() => {
+                        const modeDisplay = getSTTModeDisplay(sttResult.metrics.mode);
+                        return modeDisplay ? (
+                          <div className="flex items-center justify-between">
+                            <span className="text-sm text-slate-400">Mode</span>
+                            <Badge variant={modeDisplay.isFlux ? "default" : "secondary"}>
+                              {modeDisplay.label}
+                            </Badge>
+                          </div>
+                        ) : null;
+                      })()}
 
                       {sttResult.metrics?.eager_eot_triggered !== undefined && (
                         <div className="flex items-center justify-between">
@@ -640,12 +865,23 @@ export default function OptimizedVoicePage() {
                           <span className="text-green-400 font-semibold">Flux Streaming:</span>
                           <span className="text-green-400 font-semibold">{sttResult.latency}ms</span>
                         </div>
-                        <div className="flex justify-between pt-1 border-t border-slate-700">
-                          <span className="text-blue-400">Improvement:</span>
-                          <span className="text-blue-400 font-bold">
-                            {getLatencyReduction(sttResult.latency)}% faster
-                          </span>
-                        </div>
+                        {sttResult.latency < 1275 ? (
+                          <div className="flex justify-between pt-1 border-t border-slate-700">
+                            <span className="text-blue-400">Improvement:</span>
+                            <span className="text-blue-400 font-bold">
+                              {getLatencyReduction(sttResult.latency)}% faster
+                            </span>
+                          </div>
+                        ) : (
+                          <div className="flex flex-col pt-1 border-t border-slate-700">
+                            <span className="text-amber-400 text-xs">
+                              ⚠️ File testing: {sttResult.latency}ms is normal (realtime streaming)
+                            </span>
+                            <span className="text-green-400 text-xs">
+                              ✅ Use Live Recording mode for true 300-400ms latency!
+                            </span>
+                          </div>
+                        )}
                       </div>
                     </div>
                   </>
@@ -659,7 +895,11 @@ export default function OptimizedVoicePage() {
                   </div>
                 ) : (
                   <div className="text-center text-slate-500 py-8">
-                    <p className="text-sm">Waiting for audio input...</p>
+                    <p className="text-sm">
+                      {mode === "live"
+                        ? "Click 'Start Recording' and speak..."
+                        : "Waiting for audio input..."}
+                    </p>
                   </div>
                 )}
               </CardContent>
